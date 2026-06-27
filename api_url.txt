@@ -1,1 +1,1 @@
-https://tbrown-course-api.onrender.com
+https://course-registration-api-trudy-brown.onrender.com 
