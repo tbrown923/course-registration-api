@@ -2,9 +2,9 @@ name: Python Application Test Pipeline
 
 on:
   push:
-    branches: [ 'main' ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ 'main' ]
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -16,12 +16,12 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: "3.11"
         
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install fastapi uvicorn beautifulsoup4 httpx pydantic
+        pip install fastapi uvicorn beautifulsoup4 httpx pydantic python-multipart
         
     - name: Run Python verification
       run: |
