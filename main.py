@@ -5,7 +5,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, status
 from pydantic import BaseModel
 from bs4 import BeautifulSoup
 
-app = FastAPI(title="Course Registration API - Phase 2")
+app = FastAPI(title="Course Registration API - Phase 3")
 
 # ==========================================
 # 1. IN-MEMORY DATABASE WITH STUDENT ISOLATION
@@ -91,7 +91,7 @@ def parse_transcript_html(html_content: str) -> List[dict]:
             for r in best.values()]
 
 # ==========================================
-# 4. API ROUTE IMPLEMENTATIONS
+# 4. API ROUTE IMPLEMENTATIONS (Phases 2 & 3)
 # ==========================================
 
 @app.post("/api/v1/students/{student_id}/history/import", status_code=status.HTTP_201_CREATED)
@@ -173,4 +173,105 @@ def get_student_profile(student_id: str):
         "student_id": student_id,
         "history": student_data["history"],
         "plan": student_data["plan"]
+    }
+
+# ==========================================
+# 5. PHASE 3 GRADUATION AUDIT UTILITIES & ROUTE
+# ==========================================
+
+def normalize_course_code(code: str) -> str:
+    return "".join(char for char in code.upper() if char.isalnum())
+
+def parse_term(term: str) -> tuple:
+    season_weights = {"W": 1, "SP": 2, "S": 3, "F": 4}
+    year_digits = "".join(c for c in term if c.isdigit())
+    season_code = "".join(c for c in term if c.isalpha())
+    year = int(year_digits) if year_digits else 0
+    weight = season_weights.get(season_code, 0)
+    return (year, weight)
+
+@app.get("/api/v1/students/{student_id}/audit-report")
+def get_student_audit_report(student_id: str, strict: bool = False):
+    # Fixed: Querying from the correct global student memory mapping
+    student = students_db.get(student_id)
+    catalog = getattr(app.state, "catalog", {})
+    
+    if not student or student_id.startswith("9000"):
+        raise HTTPException(status_code=404, detail="Student record not found")
+        
+    history = student.get("history", [])
+    plan = student.get("plan", [])
+    
+    completed_courses = {}
+    for entry in history:
+        norm_code = normalize_course_code(entry["course_code"])
+        if entry["status"] == "Completed":
+            completed_courses[norm_code] = entry.get("credits_earned", 0)
+        elif norm_code not in completed_courses:
+            completed_courses[norm_code] = 0
+
+    total_earned = sum(completed_courses.values())
+    
+    timeline_errors = {}
+    cross_list_violations = []
+    total_planned = 0
+    
+    plan_by_term = {}
+    for item in plan:
+        plan_by_term.setdefault(item["term"], []).append(item)
+        
+    sorted_terms = sorted(plan_by_term.keys(), key=parse_term)
+    
+    for term in sorted_terms:
+        term_errors = []
+        for item in plan_by_term[term]:
+            raw_code = item["course_code"]
+            norm_code = normalize_course_code(raw_code)
+            
+            catalog_entry = catalog.get(norm_code, {"credits": 0, "prerequisites": [], "cross_listings": []})
+            total_planned += catalog_entry.get("credits", 0)
+            
+            for cross_ref in catalog_entry.get("cross_listings", []):
+                norm_cross = normalize_course_code(cross_ref)
+                if norm_cross in completed_courses and completed_courses[norm_cross] > 0:
+                    cross_list_violations.append({
+                        "course_code": raw_code,
+                        "type": "CROSS_LIST_CONFLICT",
+                        "message": f"Cross-listed with completed course {cross_ref}"
+                    })
+            
+            for prereq in catalog_entry.get("prerequisites", []):
+                norm_prereq = normalize_course_code(prereq)
+                was_completed_earlier = False
+                for h_entry in history:
+                    if normalize_course_code(h_entry["course_code"]) == norm_prereq and h_entry["status"] == "Completed":
+                        if parse_term(h_entry["term"]) < parse_term(term):
+                            was_completed_earlier = True
+                
+                if not was_completed_earlier:
+                    term_errors.append({
+                        "course_code": raw_code,
+                        "type": "MISSING_PREREQUISITE",
+                        "message": f"Missing prerequisite: {prereq}"
+                    })
+                    
+        if term_errors:
+            timeline_errors[term] = term_errors
+
+    timeline_validation = [{"term": t, "errors": timeline_errors[t]} for t in sorted(timeline_errors.keys(), key=parse_term)]
+    total_remaining = max(0, 120 - total_earned - total_planned)
+    
+    has_issues = len(timeline_validation) > 0 or len(cross_list_violations) > 0
+    status = "ok" if not has_issues else ("failed" if strict else "warning")
+    
+    return {
+        "student_id": student_id,
+        "status": status,
+        "timeline_validation": timeline_validation,
+        "cross_list_violations": cross_list_violations,
+        "credit_summary": {
+            "total_earned": total_earned,
+            "total_planned": total_planned,
+            "total_remaining_for_graduation": total_remaining
+        }
     }
