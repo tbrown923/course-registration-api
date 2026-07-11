@@ -34,9 +34,9 @@ class ValidationResponse(BaseModel):
 
 # --- API Endpoints ---
 
-# Handles both GET and HEAD requests at the root URL to pass initialization checks
-@app.route("/", methods=["GET", "HEAD"])
-async def read_root(request):
+# Fixed: Uses api_route to handle both GET and HEAD requests at the root URL safely
+@app.api_route("/", methods=["GET", "HEAD"])
+async def read_root():
     return {"status": "API is operational", "version": "1.0.0"}
 
 # Prefixed endpoint that the grading script tests
