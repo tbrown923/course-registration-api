@@ -34,9 +34,9 @@ class ValidationResponse(BaseModel):
 
 # --- API Endpoints ---
 
-# Root endpoint at the very base URL to clear the 404 initialization error
-@app.get("/")
-def read_root():
+# Handles both GET and HEAD requests at the root URL to pass initialization checks
+@app.route("/", methods=["GET", "HEAD"])
+async def read_root(request):
     return {"status": "API is operational", "version": "1.0.0"}
 
 # Prefixed endpoint that the grading script tests
