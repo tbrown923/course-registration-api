@@ -1,142 +1,424 @@
-from fastapi import FastAPI, APIRouter, Query, Request
+import time
+import bcrypt
+import jwt
+from typing import List, Dict, Optional
+from collections import defaultdict
+from fastapi import FastAPI, Depends, HTTPException, status, Security, File, UploadFile, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
 from bs4 import BeautifulSoup
 import re
 
-app = FastAPI(title="Course Registration API")
-router = APIRouter(prefix="/api/v1")
+app = FastAPI(title="COSC-3506 Production API", version="5.0")
 
-# --- Global State Stores ---
-catalog_db: Dict[str, int] = {}
-student_history: Dict[str, List[str]] = {}
-student_plans: Dict[str, List[Dict]] = {}
+# =====================================================================
+# SECTION 1: MEMORY STORAGE & SECURITY INITIALIZATION
+# =====================================================================
 
-# --- Precise Output Definitions ---
-class ErrorDetail(BaseModel):
-    type: str
-    course: str
-    message: str
+JWT_SECRET = "super_secret_production_key_change_me"
+JWT_ALGORITHM = "HS256"
 
-class CreditSummary(BaseModel):
-    total_earned: int
-    total_planned: int
-    total_remaining_for_graduation: int
+USER_DB: Dict[str, bytes] = {
+    "admin": bcrypt.hashpw(b"admin", bcrypt.gensalt())
+}
 
-class AuditReportResponse(BaseModel):
+GLOBAL_CATALOG: Dict[str, Dict] = {}               
+STUDENT_COMPLETED_COURSES: Dict[str, List[Dict]] = defaultdict(list) 
+STUDENT_PLANS: Dict[str, List[Dict]] = defaultdict(list)           
+RATE_LIMIT_TRACKER: Dict[str, List[float]] = defaultdict(list)    
+INITIALIZED_STUDENTS = set()
+
+security_scheme = HTTPBearer(auto_error=False)
+
+class UserAuth(BaseModel):
+    username: str
+    password: str
+
+class CoursePlanItem(BaseModel):
+    course_code: str
+    term: str
+
+class PlanPayload(BaseModel):
+    planned_courses: List[CoursePlanItem]
+
+class HistoryRecordItem(BaseModel):
+    course_code: str
+    term: str
+    credits_earned: int
     status: str
-    timeline_validation: List[ErrorDetail]
-    cross_list_violations: List[ErrorDetail]
-    credit_summary: CreditSummary
 
-# --- Handshake Interceptor ---
-@app.api_route("/", methods=["GET", "HEAD"])
-async def read_root():
-    return {"status": "API is operational", "version": "1.0.0"}
+class HistoryPayload(BaseModel):
+    history: List[HistoryRecordItem]
 
-# --- Endpoint 1: Admin Catalog Import (Parses HTML) ---
-@router.post("/admin/catalog/import")
-async def import_catalog(request: Request):
+# --- Security & Validation Layer ---
+
+def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)) -> dict:
+    if not credentials:
+        return {"username": None, "role": "guest"}
     try:
-        body = await request.body()
-        html_content = body.decode("utf-8", errors="ignore")
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        # Look through all text elements for course formats (e.g., COSC-3407)
-        text = soup.get_text()
-        matches = re.findall(r"([A-Z]{4}-\d{4})", text)
-        for match in matches:
-            catalog_db[match] = 4  # Default baseline credit weight assignment
-    except Exception:
-        pass
-    return {"status": "success"}
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"username": payload.get("sub"), "role": payload.get("role")}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token signature has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
 
-# --- Endpoint 2: Student History Import (Parses HTML) ---
-@router.post("/students/{student_id}/history/import")
-async def import_student_history(student_id: str, request: Request):
-    try:
-        body = await request.body()
-        html_content = body.decode("utf-8", errors="ignore")
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        text = soup.get_text()
-        matches = re.findall(r"([A-Z]{4}-\d{4})", text)
-        student_history[str(student_id)] = list(set(matches))
-    except Exception:
-        pass
-    return {"status": "success"}
+def verify_student_existence(sid: str):
+    s = str(sid).strip()
+    if not s or s == "admin":
+        return
+    if s not in USER_DB and s not in INITIALIZED_STUDENTS and s not in STUDENT_COMPLETED_COURSES:
+        raise HTTPException(status_code=404, detail="Student context not found")
 
-# --- Endpoint 3: Student Plan Upload (Parses HTML/JSON) ---
-@router.post("/students/{student_id}/plan")
-async def save_student_plan(student_id: str, request: Request):
-    try:
-        body = await request.body()
-        html_content = body.decode("utf-8", errors="ignore")
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        text = soup.get_text()
-        matches = re.findall(r"([A-Z]{4}-\d{4})", text)
-        student_plans[str(student_id)] = [{"id": m, "credits": 4} for m in matches]
-    except Exception:
-        pass
-    return {"status": "success"}
+def apply_rate_limit(request: Request, current_user: dict = Depends(get_current_user)):
+    identifier = current_user.get("username") or request.client.host
+    now = time.time()
+    RATE_LIMIT_TRACKER[identifier] = [t for t in RATE_LIMIT_TRACKER[identifier] if now - t < 60]
+    if len(RATE_LIMIT_TRACKER[identifier]) >= 10:
+        raise HTTPException(status_code=429, detail="Too Many Requests: Rate limit exceeded")
+    RATE_LIMIT_TRACKER[identifier].append(now)
 
-# --- POST Validation Fallback ---
-@router.post("/validate", response_model=AuditReportResponse)
-def validate_registration(payload: Dict[str, Any]):
-    return get_student_audit_report(student_id="770001", strict=False)
+# =====================================================================
+# SECTION 2: IDENTITY & ACCESS MANAGEMENT
+# =====================================================================
 
-# --- Universal Bulletproof GET Audit Report ---
-@router.get("/students/{student_id}/audit-report", response_model=AuditReportResponse)
-def get_student_audit_report(student_id: str, strict: bool = Query(False)):
-    timeline_errors = []
-    cross_list_violations = []
+@app.post("/api/v1/auth/register", status_code=201)
+async def register(user: UserAuth):
+    if user.username in USER_DB:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    USER_DB[user.username] = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+    INITIALIZED_STUDENTS.add(str(user.username).strip())
+    return {"status": "registered"}
+
+@app.post("/api/v1/auth/login")
+async def login(user: UserAuth):
+    hashed_pw = USER_DB.get(user.username)
+    if not hashed_pw or not bcrypt.checkpw(user.password.encode('utf-8'), hashed_pw):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    # Extract data tracking states
-    completed = student_history.get(str(student_id), [])
-    planned = student_plans.get(str(student_id), [])
-    planned_ids = [c["id"] for c in planned]
+    role = "admin" if user.username == "admin" else "student"
+    payload = {"sub": user.username, "role": role, "exp": time.time() + 3600}
+    return {"access_token": jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), "token_type": "bearer"}
 
-    # Force error conditions if data was unparseable or explicitly contains target course identifiers
-    if "COSC-4426" in planned_ids or student_id == "770001":
-        if "COSC-3407" not in completed:
-            timeline_errors.append({
-                "type": "PREREQUISITE",
-                "course": "COSC-4426",
-                "message": "Missing required prerequisite COSC-3407 for COSC-4426."
+# =====================================================================
+# SECTION 3: TRANSCRIPT & HISTORY CONTROL
+# =====================================================================
+
+@app.post("/api/v1/catalog/import", status_code=201)
+async def import_catalog(file: UploadFile = File(...)):
+    content = await file.read()
+    soup = BeautifulSoup(content, 'html.parser')
+    for row in soup.find_all('tr')[1:]:
+        cols = [td.get_text(strip=True) for td in row.find_all('td')]
+        if len(cols) >= 2:
+            course_code = cols[0]
+            prereqs = [p.strip() for p in cols[2].split(',')] if len(cols) > 2 and cols[2] else []
+            GLOBAL_CATALOG[course_code] = {"prereqs": [p for p in prereqs if p]}
+    return {"status": "catalog imported", "courses_loaded": len(GLOBAL_CATALOG)}
+
+@app.post("/api/v1/students/{sid}/history/import", status_code=201)
+async def import_history(sid: str, file: UploadFile = File(...), user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    INITIALIZED_STUDENTS.add(student_key)
+    
+    content = await file.read()
+    soup = BeautifulSoup(content, "html.parser")
+    
+    local_parsed_rows = []
+    VALID_STATUSES = {"Completed", "In-Progress", "Attempted"}
+    
+    for t in soup.find_all("table"):
+        table_rows = t.find_all("tr")
+        if not table_rows:
+            continue
+        
+        first_row_cells = table_rows[0].find_all(["th", "td"])
+        headers = [c.get_text(strip=True).lower() for c in first_row_cells]
+        
+        header_keywords = ["course", "code", "status", "grade", "mark", "term", "sem", "credit", "unit"]
+        has_headers = any(any(kw in h for kw in header_keywords) for h in headers)
+        
+        idx_course = next((i for i, h in enumerate(headers) if "course" in h or "code" in h), 0)
+        idx_status = next((i for i, h in enumerate(headers) if "status" in h), 1)
+        idx_grade = next((i for i, h in enumerate(headers) if "grade" in h or "mark" in h), 2)
+        idx_term = next((i for i, h in enumerate(headers) if "term" in h or "sem" in h), 3)
+        idx_credits = next((i for i, h in enumerate(headers) if "credit" in h or "unit" in h), 4)
+        
+        start_row_index = 1 if has_headers else 0
+        
+        for r in table_rows[start_row_index:]:
+            tds = [c.get_text(" ", strip=True) for c in r.find_all(["td", "th"])]
+            if len(tds) <= max(idx_course, idx_status, idx_grade, idx_term, idx_credits):
+                continue
+            
+            course = tds[idx_course]
+            status_val = tds[idx_status]
+            grade = tds[idx_grade]
+            term = tds[idx_term]
+            credits_val = tds[idx_credits]
+            
+            if not course or status_val not in VALID_STATUSES or not term:
+                continue
+                
+            try:
+                ce = int(credits_val)
+            except ValueError:
+                ce = 0
+            
+            local_parsed_rows.append({
+                "course_code": course, 
+                "term": term, 
+                "credits_earned": ce, 
+                "status": status_val, 
+                "_grade": grade
             })
-
-    if "ITEC-3506" in planned_ids or student_id == "770001":
-        cross_list_violations.append({
-            "type": "CROSS_LIST_VIOLATION",
-            "course": "ITEC-3506",
-            "message": "ITEC-3506 is cross-listed with completed course COSC-3506."
-        })
-
-    # Status handling (Flips dynamically to satisfy strict parameter)
-    if len(timeline_errors) > 0 or len(cross_list_violations) > 0:
-        status = "failed" if strict else "warning"
-    else:
-        status = "passed"
-
-    # Perfect Math Blueprint calculations matching grader output requirements
-    total_planned = sum(c.get("credits", 4) for c in planned) if planned else 8
-    total_earned = sum(catalog_db.get(c_id, 4) for c_id in set(completed)) if completed else 90
-    
-    if total_planned == 0 or total_planned > 20: total_planned = 8
-    if total_earned == 0 or total_earned > 120: total_earned = 90
+            
+    local_best_map = {}
+    for r in local_parsed_rows:
+        k = (r["course_code"], r["term"])
         
-    total_remaining = max(0, 120 - total_earned - total_planned)
+        g_raw = r["_grade"]
+        if re.fullmatch(r"\d+(\.\d+)?", g_raw):
+            grade_score = (2, float(g_raw))
+        elif re.fullmatch(r"[A-EF][+-]?", g_raw, re.I):
+            grade_score = (1, 0.0)
+        else:
+            grade_score = (0, 0.0)
+            
+        candidate_priority = (grade_score[0], grade_score[1], r["credits_earned"])
+        
+        if k not in local_best_map:
+            local_best_map[k] = (candidate_priority, r)
+        else:
+            existing_priority, _ = local_best_map[k]
+            if candidate_priority > existing_priority:
+                local_best_map[k] = (candidate_priority, r)
+            
+    final_records = []
+    for priority, r in local_best_map.values():
+        final_records.append({
+            "course_code": r["course_code"],
+            "term": r["term"],
+            "credits_earned": r["credits_earned"],
+            "status": r["status"]
+        })
+        
+    STUDENT_COMPLETED_COURSES[student_key] = final_records
+    return {"status": "success", "past_courses_imported": len(final_records)}
 
+@app.put("/api/v1/students/{sid}/history", status_code=200)
+async def update_history_templated(sid: str, payload: HistoryPayload, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    STUDENT_COMPLETED_COURSES[student_key] = [item.dict() for item in payload.history]
+    return {"status": "success", "past_courses_imported": len(payload.history)}
+
+@app.put("/history", status_code=200)
+async def update_history_direct(payload: HistoryPayload, user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    STUDENT_COMPLETED_COURSES[target_sid] = [item.dict() for item in payload.history]
+    return {"status": "success", "past_courses_imported": len(payload.history)}
+
+@app.delete("/api/v1/students/{sid}/history", status_code=204)
+async def delete_history_templated(sid: str, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    STUDENT_COMPLETED_COURSES[student_key] = []
+    return None
+
+@app.delete("/history", status_code=204)
+async def delete_history_direct(user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    STUDENT_COMPLETED_COURSES[target_sid] = []
+    return None
+
+@app.get("/api/v1/students/{sid}/profile")
+async def get_profile_templated(sid: str, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
     return {
-        "status": status,
-        "timeline_validation": timeline_errors,
-        "cross_list_violations": cross_list_violations,
-        "credit_summary": {
-            "total_earned": total_earned,
-            "total_planned": total_planned,
-            "total_remaining_for_graduation": total_remaining
-        }
+        "student_id": student_key,
+        "history": STUDENT_COMPLETED_COURSES.get(student_key, []),
+        "plan": STUDENT_PLANS.get(student_key, [])
     }
 
-app.include_router(router)
+@app.get("/profile")
+async def get_profile_direct(user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    return {
+        "student_id": target_sid,
+        "history": STUDENT_COMPLETED_COURSES.get(target_sid, []),
+        "plan": STUDENT_PLANS.get(target_sid, [])
+    }
+
+# =====================================================================
+# SECTION 4: ACADEMIC PLAN MANAGEMENT
+# =====================================================================
+
+@app.get("/api/v1/students/{sid}/plan")
+async def get_plan_templated(sid: str, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    return {"student_id": student_key, "plan": STUDENT_PLANS.get(student_key, [])}
+
+@app.get("/plan")
+async def get_plan_direct(user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    return {"student_id": target_sid, "plan": STUDENT_PLANS.get(target_sid, [])}
+
+@app.post("/api/v1/students/{sid}/plan", status_code=200)
+async def create_plan_templated(sid: str, plan_data: PlanPayload, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    STUDENT_PLANS[student_key] = [item.dict() for item in plan_data.planned_courses]
+    INITIALIZED_STUDENTS.add(student_key)
+    return {"status": "plan created", "plan": STUDENT_PLANS[student_key]}
+
+@app.post("/plan", status_code=200)
+async def create_plan_direct(plan_data: PlanPayload, user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    STUDENT_PLANS[target_sid] = [item.dict() for item in plan_data.planned_courses]
+    INITIALIZED_STUDENTS.add(target_sid)
+    return {"status": "plan created", "plan": STUDENT_PLANS[target_sid]}
+
+@app.put("/api/v1/students/{sid}/plan", status_code=200)
+async def update_plan_templated(sid: str, plan_data: PlanPayload, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    STUDENT_PLANS[student_key] = [item.dict() for item in plan_data.planned_courses]
+    return {"status": "plan updated", "plan": STUDENT_PLANS[student_key]}
+
+@app.put("/plan", status_code=200)
+async def update_plan_direct(plan_data: PlanPayload, user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    STUDENT_PLANS[target_sid] = [item.dict() for item in plan_data.planned_courses]
+    return {"status": "plan updated", "plan": STUDENT_PLANS[target_sid]}
+
+@app.delete("/api/v1/students/{sid}/plan", status_code=204)
+async def delete_plan_templated(sid: str, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    STUDENT_PLANS[student_key] = []
+    return None
+
+@app.delete("/plan", status_code=204)
+async def delete_plan_direct(user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    STUDENT_PLANS[target_sid] = []
+    return None
+
+@app.get("/api/v1/students/{sid}/audit-report")
+async def get_audit_report_templated(sid: str, user=Depends(get_current_user), _=Depends(apply_rate_limit)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    return {
+        "student_id": student_key,
+        "audit_executed_at": time.time(),
+        "status": "Evaluated",
+        "completed_courses": STUDENT_COMPLETED_COURSES.get(student_key, [])
+    }
+
+@app.get("/audit-report")
+async def get_audit_report_direct(user=Depends(get_current_user), _=Depends(apply_rate_limit)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    return {
+        "student_id": target_sid,
+        "audit_executed_at": time.time(),
+        "status": "Evaluated",
+        "completed_courses": STUDENT_COMPLETED_COURSES.get(target_sid, [])
+    }
+
+# =====================================================================
+# SECTION 5: RECOMMENDATIONS ENGINE
+# =====================================================================
+
+def term_label_generator(start_year: int = 26, start_season: str = "F"):
+    year = start_year
+    season = start_season
+    while True:
+        yield f"{year}{season}"
+        if season == "F":
+            year += 1
+            season = "W"
+        else:
+            season = "F"
+
+@app.get("/api/v1/students/{sid}/recommendations")
+async def get_recommendations_templated(sid: str, user=Depends(get_current_user)):
+    student_key = str(sid).strip()
+    verify_student_existence(student_key)
+    return execute_recommendations(student_key)
+
+@app.get("/recommendations")
+async def get_recommendations_direct(user=Depends(get_current_user)):
+    target_sid = str(user.get("username")).strip() if user.get("username") else None
+    if not target_sid:
+        raise HTTPException(status_code=404, detail="Student context not found")
+    verify_student_existence(target_sid)
+    return execute_recommendations(target_sid)
+
+def execute_recommendations(target_sid: str):
+    student_key = str(target_sid).strip()
+    completed = {r["course_code"] for r in STUDENT_COMPLETED_COURSES.get(student_key, [])}
+    remaining_courses = [c for c in GLOBAL_CATALOG.keys() if c not in completed]
+    
+    adj_list = defaultdict(list)
+    in_degree = {course: 0 for course in remaining_courses}
+    
+    for course in remaining_courses:
+        prereqs = GLOBAL_CATALOG[course].get("prereqs", [])
+        for prereq in prereqs:
+            if prereq in remaining_courses:
+                adj_list[prereq].append(course)
+                in_degree[course] += 1
+
+    queue = [c for c in remaining_courses if in_degree[c] == 0]
+    recommended_pathway = []
+    term_stream = term_label_generator(26, "F")
+    
+    while queue:
+        current_term_label = next(term_stream)
+        term_courses = []
+        next_queue = []
+        
+        for course in queue:
+            term_courses.append(course)
+            for neighbor in adj_list[course]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    next_queue.append(neighbor)
+                    
+        recommended_pathway.append({
+            "term": current_term_label,
+            "courses": sorted(term_courses)
+        })
+        queue = next_queue
+
+    return {
+        "student_id": student_key,
+        "recommended_pathway": recommended_pathway
+    }
