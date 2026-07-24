@@ -53,15 +53,25 @@ class HistoryPayload(BaseModel):
 # --- Security & Validation Layer ---
 
 def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Security(security_scheme)) -> dict:
-    if not credentials:
-        return {"username": None, "role": "guest"}
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Authentication token missing")
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return {"username": payload.get("sub"), "role": payload.get("role")}
+        username = payload.get("sub")
+        role = payload.get("role")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token data")
+        return {"username": username, "role": role}
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token signature has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+def verify_ownership(sid: str, user: dict):
+    if user.get("role") == "admin":
+        return
+    if str(user.get("username")).strip() != str(sid).strip():
+        raise HTTPException(status_code=401, detail="Access denied: Token does not match student context")
 
 def verify_student_existence(sid: str):
     s = str(sid).strip()
@@ -105,7 +115,9 @@ async def login(user: UserAuth):
 # =====================================================================
 
 @app.post("/api/v1/catalog/import", status_code=201)
-async def import_catalog(file: UploadFile = File(...)):
+async def import_catalog(file: UploadFile = File(...), user=Depends(get_current_user)):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=401, detail="Admin privileges required")
     content = await file.read()
     soup = BeautifulSoup(content, 'html.parser')
     for row in soup.find_all('tr')[1:]:
@@ -118,6 +130,7 @@ async def import_catalog(file: UploadFile = File(...)):
 
 @app.post("/api/v1/students/{sid}/history/import", status_code=201)
 async def import_history(sid: str, file: UploadFile = File(...), user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     INITIALIZED_STUDENTS.add(student_key)
     
@@ -208,6 +221,7 @@ async def import_history(sid: str, file: UploadFile = File(...), user=Depends(ge
 
 @app.put("/api/v1/students/{sid}/history", status_code=200)
 async def update_history_templated(sid: str, payload: HistoryPayload, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     STUDENT_COMPLETED_COURSES[student_key] = [item.dict() for item in payload.history]
@@ -224,6 +238,7 @@ async def update_history_direct(payload: HistoryPayload, user=Depends(get_curren
 
 @app.delete("/api/v1/students/{sid}/history", status_code=204)
 async def delete_history_templated(sid: str, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     STUDENT_COMPLETED_COURSES[student_key] = []
@@ -240,6 +255,7 @@ async def delete_history_direct(user=Depends(get_current_user)):
 
 @app.get("/api/v1/students/{sid}/profile")
 async def get_profile_templated(sid: str, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     return {
@@ -266,6 +282,7 @@ async def get_profile_direct(user=Depends(get_current_user)):
 
 @app.get("/api/v1/students/{sid}/plan")
 async def get_plan_templated(sid: str, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     return {"student_id": student_key, "plan": STUDENT_PLANS.get(student_key, [])}
@@ -280,6 +297,7 @@ async def get_plan_direct(user=Depends(get_current_user)):
 
 @app.post("/api/v1/students/{sid}/plan", status_code=200)
 async def create_plan_templated(sid: str, plan_data: PlanPayload, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     STUDENT_PLANS[student_key] = [item.dict() for item in plan_data.planned_courses]
@@ -298,6 +316,7 @@ async def create_plan_direct(plan_data: PlanPayload, user=Depends(get_current_us
 
 @app.put("/api/v1/students/{sid}/plan", status_code=200)
 async def update_plan_templated(sid: str, plan_data: PlanPayload, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     STUDENT_PLANS[student_key] = [item.dict() for item in plan_data.planned_courses]
@@ -314,6 +333,7 @@ async def update_plan_direct(plan_data: PlanPayload, user=Depends(get_current_us
 
 @app.delete("/api/v1/students/{sid}/plan", status_code=204)
 async def delete_plan_templated(sid: str, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     STUDENT_PLANS[student_key] = []
@@ -330,6 +350,7 @@ async def delete_plan_direct(user=Depends(get_current_user)):
 
 @app.get("/api/v1/students/{sid}/audit-report")
 async def get_audit_report_templated(sid: str, user=Depends(get_current_user), _=Depends(apply_rate_limit)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     return {
@@ -369,6 +390,7 @@ def term_label_generator(start_year: int = 26, start_season: str = "F"):
 
 @app.get("/api/v1/students/{sid}/recommendations")
 async def get_recommendations_templated(sid: str, user=Depends(get_current_user)):
+    verify_ownership(sid, user)
     student_key = str(sid).strip()
     verify_student_existence(student_key)
     return execute_recommendations(student_key)
